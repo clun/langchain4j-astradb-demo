@@ -38,6 +38,8 @@ import java.util.Map;
 import java.util.UUID;
 
 import static dev.langchain4j.model.openai.OpenAiModelName.GPT_3_5_TURBO;
+import static io.stargate.sdk.data.domain.SimilarityMetric.cosine;
+import static io.stargate.sdk.http.domain.FilterOperator.EQUALS_TO;
 
 @Slf4j
 public class AstraDbEmbeddingStoreRagTest {
@@ -46,6 +48,7 @@ public class AstraDbEmbeddingStoreRagTest {
 
     String astraToken = "AstraCS:<change_me>";
     String apiEndpoint = "https://<change_me>>.apps.astra.datastax.com/api/json";
+
     String keyspace = "default_keyspace";
     String collectionName = "demo_collection";
     int vectorDimension = 1536;
@@ -54,29 +57,24 @@ public class AstraDbEmbeddingStoreRagTest {
     public void testAstraDbEmbeddingStore() throws FileNotFoundException {
 
         /*
-         * ------------------------------------
-         *    Accessing your Astra Database
-         * ------------------------------------
-         * To know more about what you can do:
+         * Accessing Astra Database
+         *
+         * Operations at DB level:
          * @see https://awesome-astra.github.io/docs/pages/develop/sdk/astra-db-client-java/#working-with-collections
          */
         AstraDB sampleDb = new AstraDB(astraToken, apiEndpoint, keyspace);
         log.info("You are connected to Astra on keyspace '{}'", sampleDb.getCurrentKeyspace());
 
         /*
-         * ------------------------------------
-         *   Create a retrieve a collection
-         * ------------------------------------
-         *  AstraDBCollection collection = sampleDb.collection("demo_collection");
-         *  boolean collection = sampleDb.isCollectionExists("demo_collection")
+         * Accessing a collection (create if not exists)
+         *
+         * Operations at Collection level:
+         * @see https://awesome-astra.github.io/docs/pages/develop/sdk/astra-db-client-java/#working-with-documents
          */
-        AstraDBCollection collection = sampleDb.createCollection(collectionName, vectorDimension, SimilarityMetric.cosine);
+        AstraDBCollection collection = sampleDb.createCollection(collectionName, vectorDimension, cosine);
         log.info("Your collection '{}' has been created (if needed) ", collectionName);
 
-        /*
-         * Flushing the Collection Before Starting
-         * To delete the collection itself => sampleDb.deleteCollection("demo_collection");
-         */
+        // Flushing Collection
         collection.deleteAll();
         log.info("Your collection '{}' has been flushed", collectionName);
 
@@ -90,13 +88,15 @@ public class AstraDbEmbeddingStoreRagTest {
                 .modelName(OpenAiEmbeddingModelName.TEXT_EMBEDDING_3_SMALL)
                 .build();
 
-        // Ingesting Documents with in ID (if not provided a id is created for you
-        UUID doc1Id = UUID.randomUUID();
-        UUID doc2Id = UUID.randomUUID();
-        ingestDocument(doc1Id, "johnny.txt", embeddingModel, embeddingStore);
-        ingestDocument(doc2Id, "story-about-happy-carrot.txt", embeddingModel, embeddingStore);
+        // in that sample it was ask to create a metadata document_id for filters
+        UUID documentId1 = UUID.randomUUID();
+        UUID documentId2 = UUID.randomUUID();
+        ingestDocument(documentId1, "johnny.txt", embeddingModel, embeddingStore);
+        ingestDocument(documentId2, "story-about-happy-carrot.txt", embeddingModel, embeddingStore);
 
-        // -- Semantic Search
+        // ---------------------
+        // ------- RAG ---------
+        // ---------------------
 
         // Specify the question you want to ask the model
         String question = "Who is Johnny ?";
@@ -106,26 +106,26 @@ public class AstraDbEmbeddingStoreRagTest {
 
         /*
          * ------------------------------------
-         * Add a MedataFilter (search by doc ID)
-         * To know more about filters:
+         * Search with metadata filtering
+         *
          * @see https://awesome-astra.github.io/docs/pages/develop/sdk/astra-db-client-java/#find-one
-         * new Filter().where("document_id", FilterOperator.EQUALS_TO, "johnny.txt");
          * ------------------------------------
          */
         Filter filterByDocumentId = new Filter()
-                .where("document_id", FilterOperator.EQUALS_TO, doc1Id.toString());
+                .where("document_id", EQUALS_TO, documentId1.toString());
 
         // Limit result to keep relevant informations
         int maxResults = 5;
 
-        // You can directly Filter on the collection
-        log.info("RAG Search with the Collection");
-        List<String> ragChunks = ragSearchWithTheCollection(collection, questionEmbedding.content().vector(), filterByDocumentId, maxResults);
-        ragChunks.forEach(chunk -> log.info(" + chunk: {}", chunk));
+        // Minimum score to keep the result
+        double minScore = 0.3;
 
         log.info("RAG Search with the Store");
-        List<String> ragChunks2 =  ragSearchWithStore(embeddingStore, questionEmbedding.content(), filterByDocumentId, maxResults, 0.3);
-        ragChunks2.forEach(chunk -> log.info(" + chunk: {}", chunk));
+        String ragContext = String.join(",", embeddingStore
+            .findRelevant(questionEmbedding.content(), filterByDocumentId,  maxResults, minScore)
+            .stream()
+            .map(emb -> emb.embedded().text())
+            .toList());
 
         // Prompting with Rag context
         PromptTemplate promptTemplate = PromptTemplate.from(
@@ -136,7 +136,7 @@ public class AstraDbEmbeddingStoreRagTest {
                         + "{{information}}");
         Map<String, Object> variables = new HashMap<>();
         variables.put("question", question);
-        variables.put("information", String.join(",", ragChunks2));
+        variables.put("information", ragContext);
 
         Prompt prompt = promptTemplate.apply(variables);
         log.info("Final Prompt {}", prompt.text());
@@ -158,30 +158,9 @@ public class AstraDbEmbeddingStoreRagTest {
         String answer = aiMessage.content().text();
         log.info("Answer from the model: {}", answer);
 
-
         // Clean up
-        // deleteDocumentById(collection, doc1Id);
-        // deleteDocumentById(collection, doc2Id);
-
-    }
-
-    private List<String> ragSearchWithStore(AstraDbEmbeddingStore embeddingStore, Embedding embeddings, Filter metadataFilter, int maxResults, double minScore) {
-        return embeddingStore
-                .findRelevant(embeddings, metadataFilter,  maxResults, minScore)
-                .stream()
-                .map(emb -> emb.embedded().text()).toList();
-    }
-
-    private DeleteResult deleteDocumentById(AstraDBCollection collection, UUID documentId) {
-        Filter deleteByid = new Filter().where("document_id", FilterOperator.EQUALS_TO, documentId.toString());
-        return collection.deleteMany(DeleteQuery.builder().filter(deleteByid).build());
-    }
-
-    private List<String> ragSearchWithTheCollection(AstraDBCollection collection, float[] embeddings, Filter metadataFilter, int maxResults) {
-        return collection
-                .findVector(embeddings, metadataFilter, maxResults)
-                .map(res -> (String) res.getData().get("body_blob"))
-                .toList();
+        // deleteDocumentById(collection, documentId1);
+        // deleteDocumentById(collection, documentId2);
     }
 
     private void ingestDocument(UUID docId, String documentName, EmbeddingModel embeddingModel, AstraDbEmbeddingStore embeddingStore) {
@@ -211,4 +190,11 @@ public class AstraDbEmbeddingStoreRagTest {
 
         log.info("Document '{}' has been ingested with id {}", documentName, docId);
     }
+
+    private DeleteResult deleteDocumentById(AstraDBCollection collection, UUID documentId) {
+        Filter deleteByid = new Filter().where("document_id", EQUALS_TO, documentId.toString());
+        return collection.deleteMany(DeleteQuery.builder().filter(deleteByid).build());
+    }
+
+
 }
